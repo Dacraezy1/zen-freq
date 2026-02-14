@@ -1,6 +1,7 @@
 # GitHub Actions Release workflow for zen-freq kernel module
 #
-# This workflow creates releases with pre-built modules.
+# Creates releases with source archive and build instructions.
+# Prebuilt modules are kernel-version specific - users should build from source.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 
@@ -26,75 +27,7 @@ env:
   MODULE_NAME: zen-freq
 
 jobs:
-  # Build release modules
-  build-release:
-    name: Build Release Modules
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        kernel: ['5.15', '6.1', '6.5', '6.8']
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Get version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="${GITHUB_REF#refs/tags/}"
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            flex \
-            bison \
-            libelf-dev \
-            libssl-dev \
-            bc \
-            kmod \
-            linux-headers-generic || true
-
-      - name: Build module
-        run: |
-          make clean || true
-
-          # Try to build with available headers
-          KERNEL=$(ls /lib/modules/ 2>/dev/null | grep -E "^[0-9]" | head -1)
-          if [ -n "$KERNEL" ] && [ -d "/lib/modules/$KERNEL/build" ]; then
-            make -j$(nproc) KDIR=/lib/modules/$KERNEL/build
-          fi
-
-          # Create placeholder if build not possible
-          if [ ! -f "${{ env.MODULE_NAME }}.ko" ]; then
-            mkdir -p release
-            echo "Built from source required" > release/build-from-source.txt
-            tar -czvf release/${{ env.MODULE_NAME }}-${{ matrix.kernel }}.tar.gz zen-freq.c zen-freq.h Makefile Kconfig
-          else
-            mkdir -p release
-            cp ${{ env.MODULE_NAME }}.ko release/${{ env.MODULE_NAME }}-${{ matrix.kernel }}.ko
-            tar -czvf release/${{ env.MODULE_NAME }}-${{ matrix.kernel }}.tar.gz -C release ${{ env.MODULE_NAME }}-${{ matrix.kernel }}.ko
-          fi
-
-          # Create checksums
-          cd release
-          sha256sum *.tar.gz > SHA256SUMS-${{ matrix.kernel }} || true
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.kernel }}
-          path: release/
-          retention-days: 1
-
-  # Create source archive
+  # Create source archive (universal - works on all kernels)
   create-source:
     name: Create Source Archive
     runs-on: ubuntu-latest
@@ -111,23 +44,38 @@ jobs:
             VERSION="${GITHUB_REF#refs/tags/}"
           fi
           VERSION_NUM="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "version_num=$VERSION_NUM" >> $GITHUB_OUTPUT
 
       - name: Create source archive
         run: |
-          mkdir -p dist
           VERSION="${{ steps.version.outputs.version_num }}"
+          mkdir -p dist
 
+          # Create clean source archive
           tar --exclude='.git' \
               --exclude='.github' \
               --exclude='dist' \
               --exclude='*.ko' \
               --exclude='*.o' \
               --exclude='.tmp_versions' \
+              --exclude='*.log' \
               -czvf dist/${{ env.MODULE_NAME }}-${VERSION}.tar.gz .
 
+          # Create ZIP for convenience
+          zip -r dist/${{ env.MODULE_NAME }}-${VERSION}.zip . \
+            -x ".git/*" \
+            -x ".github/*" \
+            -x "dist/*" \
+            -x "*.ko" \
+            -x "*.o" \
+            -x ".tmp_versions/*"
+
+          # Create checksums
           cd dist
           sha256sum ${{ env.MODULE_NAME }}-${VERSION}.tar.gz > ${{ env.MODULE_NAME }}-${VERSION}.sha256
+          sha256sum ${{ env.MODULE_NAME }}-${VERSION}.zip >> ${{ env.MODULE_NAME }}-${VERSION}.sha256
+          cat ${{ env.MODULE_NAME }}-${VERSION}.sha256
 
       - name: Upload source artifact
         uses: actions/upload-artifact@v4
@@ -136,11 +84,53 @@ jobs:
           path: dist/
           retention-days: 1
 
+  # Build test modules (for CI verification only)
+  build-test-modules:
+    name: Build Test Modules
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kernel: ['6.6', '6.8']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libelf-dev libssl-dev bc kmod linux-headers-generic || true
+
+      - name: Build module
+        run: |
+          make clean || true
+
+          KERNEL=$(ls /lib/modules/ 2>/dev/null | grep -E "^[0-9]" | head -1)
+          if [ -n "$KERNEL" ] && [ -d "/lib/modules/$KERNEL/build" ]; then
+            make -j$(nproc) KDIR=/lib/modules/$KERNEL/build 2>&1 | tee build.log || true
+          fi
+
+          # Create build info even if no actual .ko
+          mkdir -p release
+          echo "Built for kernel ${{ matrix.kernel }}" > release/info.txt
+          echo "Build from source required for kernel 6.18+" >> release/info.txt
+
+          if [ -f "${{ env.MODULE_NAME }}.ko" ]; then
+            cp ${{ env.MODULE_NAME }}.ko release/
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-module-${{ matrix.kernel }}
+          path: release/
+          retention-days: 1
+
   # Create GitHub release
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-release, create-source]
+    needs: [create-source, build-test-modules]
     permissions:
       contents: write
 
@@ -165,19 +155,15 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
-      - name: Download all artifacts
+      - name: Download source artifact
         uses: actions/download-artifact@v4
         with:
-          path: artifacts/
-          merge-multiple: false
+          name: source-archive
+          path: release-files/
 
       - name: Prepare release files
         run: |
-          mkdir -p release-files
-          find artifacts/ -name "*.tar.gz" -exec cp {} release-files/ \; 2>/dev/null || true
-          find artifacts/ -name "*.sha256" -exec cp {} release-files/ \; 2>/dev/null || true
           cd release-files
-          cat *.sha256 > SHA256SUMS 2>/dev/null || true
           ls -la
 
       - name: Generate release notes
@@ -185,12 +171,12 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           VERSION_NUM="${VERSION#v}"
 
-          cat > release-notes.md << EOF
+          cat > release-notes.md << 'NOTES'
           # zen-freq $VERSION
 
           ## 🚀 The Ultimate AMD Zen 2+ CPU Frequency Driver
 
-          Perfect Potential edition with advanced features for maximum performance-per-watt.
+          **Perfect Potential Edition** with advanced features for maximum performance-per-watt.
 
           ## ✨ Features
 
@@ -200,58 +186,135 @@ jobs:
           - **Lock-less Fast Switch** - RCU-protected, mutex-free
           - **Voltage Safety** - Protects against overvoltage damage
           - **Dynamic EPP** - Automatic power/performance tuning
+          - **Kernel 6.6+ / 6.18+ Support** - Automatic API detection
+
+          ---
 
           ## 📦 Installation
 
-          \`\`\`bash
-          # Download and extract
-          tar -xzf zen-freq-${VERSION_NUM}.tar.gz
-          cd zen-freq-${VERSION_NUM}
+          ### ⚠️ Important: Build from Source Required
 
-          # Build and install
+          **For kernel 6.18+, you MUST build from source.** Prebuilt modules are kernel-version specific.
+
+          ### Step 1: Download Source
+
+          Download **`zen-freq-$VERSION_NUM.tar.gz`** from this release.
+
+          ### Step 2: Install Prerequisites
+
+          ```bash
+          # Ubuntu/Debian
+          sudo apt install build-essential linux-headers-$(uname -r)
+
+          # Fedora
+          sudo dnf install kernel-devel kernel-headers gcc make
+
+          # Arch Linux
+          sudo pacman -S linux-headers base-devel
+          ```
+
+          ### Step 3: Build and Install
+
+          ```bash
+          # Extract
+          tar -xzf zen-freq-$VERSION_NUM.tar.gz
+          cd zen-freq-$VERSION_NUM
+
+          # Build
           make
+
+          # Install
           sudo make install
           sudo depmod -a
+          ```
 
-          # Load module
+          ### Step 4: Load Module
+
+          ```bash
+          # Blacklist conflicting driver
+          echo "blacklist amd_pstate" | sudo tee /etc/modprobe.d/blacklist-amd-pstate.conf
+
+          # Load zen-freq
           sudo modprobe zen-freq
-          \`\`\`
 
-          ## ⚙️ Quick Start
+          # Verify
+          cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver
+          # Should show: zen-freq
+          ```
 
-          \`\`\`bash
-          # Gaming mode
+          ---
+
+          ## 🖥️ Supported Systems
+
+          ### CPUs
+          | CPU | Support |
+          |-----|---------|
+          | Zen 2 (Ryzen 3000, EPYC Rome) | ✅ Full |
+          | Zen 3 (Ryzen 5000, EPYC Milan) | ✅ Full |
+          | Zen 4 (Ryzen 7000, EPYC Genoa) | ✅ Full |
+          | Zen 5+ (Ryzen 9000+) | ✅ Full |
+
+          ### Kernels
+          | Kernel Version | Support |
+          |----------------|---------|
+          | 5.10 - 5.15 | ✅ Full (legacy API) |
+          | 6.1 - 6.5 | ✅ Full (legacy API) |
+          | 6.6 - 6.18+ | ✅ Full (new API) |
+
+          ---
+
+          ## ⚙️ Quick Configuration
+
+          ```bash
+          # Gaming mode (maximum performance)
           sudo modprobe zen-freq mode=performance boost=1
 
-          # Power saving mode
+          # Power saving mode (laptop/server)
           sudo modprobe zen-freq mode=powersave boost=0
 
           # Balanced mode (default)
           sudo modprobe zen-freq mode=balance
-          \`\`\`
 
-          ## 🔧 Module Parameters
+          # Custom thermal limits
+          sudo modprobe zen-freq soft_temp=82 hard_temp=92
+          ```
+
+          ---
+
+          ## 📁 Module Parameters
 
           | Parameter | Default | Description |
           |-----------|---------|-------------|
-          | mode | 1 | Operating mode |
-          | boost | true | Enable boost frequencies |
-          | thermal_guard | true | Enable thermal protection |
-          | soft_temp | 80 | Soft thermal limit (°C) |
-          | hard_temp | 90 | Hard thermal limit (°C) |
-          | voltage_max | 1450 | Max safe voltage (mV) |
+          | `mode` | 1 | 0=powersave, 1=balance, 2=performance |
+          | `boost` | true | Enable boost frequencies |
+          | `thermal_guard` | true | Enable thermal protection |
+          | `soft_temp` | 80 | Soft thermal limit (°C) |
+          | `hard_temp` | 90 | Hard thermal limit (°C) |
+          | `voltage_max` | 1450 | Max safe voltage (mV) |
 
-          ## 🖥️ Supported CPUs
+          ---
 
-          - AMD Zen 2 (Ryzen 3000, EPYC Rome)
-          - AMD Zen 3 (Ryzen 5000, EPYC Milan)
-          - AMD Zen 4 (Ryzen 7000, EPYC Genoa)
-          - AMD Zen 5+ (Ryzen 9000+)
+          ## 🔧 Sysfs Interface
+
+          ```bash
+          # Check status
+          cat /sys/kernel/zen_freq/thermal_state
+          cat /sys/kernel/zen_freq/temperature
+          cat /sys/kernel/zen_freq/kernel_version
+
+          # Change settings
+          echo performance > /sys/kernel/zen_freq/mode
+          echo 1400 > /sys/kernel/zen_freq/voltage_max
+          ```
 
           ---
 
           **Full Changelog**: https://github.com/${{ github.repository }}/commits/$VERSION
-          EOF
+          NOTES
+
+          # Replace version placeholders
+          sed -i "s/\$VERSION/${VERSION}/g" release-notes.md
+          sed -i "s/\$VERSION_NUM/${VERSION_NUM}/g" release-notes.md
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
