@@ -166,6 +166,18 @@ echo performance > /sys/kernel/zen_freq/mode
 | Zen 4 (Ryzen 7000, EPYC Genoa) | ✅ Full |
 | Zen 5+ (Ryzen 9000+) | ✅ Full |
 
+## 🐧 Kernel Compatibility
+
+| Kernel Version | Support |
+|----------------|---------|
+| 5.10 - 5.15 | ✅ Full |
+| 6.1 - 6.5 | ✅ Full (legacy API) |
+| 6.6 - 6.18+ | ✅ Full (new API) |
+
+The driver automatically detects kernel version and uses the appropriate API:
+- **Kernel < 6.6**: Uses `cpufreq_update_util_data` structure
+- **Kernel ≥ 6.6**: Uses new simplified callback API
+
 ---
 
 ## 📊 Performance
