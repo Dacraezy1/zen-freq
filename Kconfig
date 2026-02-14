@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config X86_ZEN_FREQ
+	tristate "AMD Zen 2+ Perfect Potential CPU frequency driver"
+	depends on X86 && ACPI_PROCESSOR && CPU_FREQ
+	select CPU_FREQ_TABLE
+	select ACPI_CPPC_LIB if ACPI
+	help
+	  This driver adds an advanced CPU frequency driver for AMD Zen 2 and
+	  newer processors with maximum performance-per-watt optimization.
+
+	  Key features:
+	    - Zero-IPI frequency transitions (no micro-stutter)
+	    - Advanced thermal guard with PI controller
+	    - I/O wait boost for instant response
+	    - Lock-less fast_switch using RCU
+	    - Voltage safety verification (silicon health)
+	    - Dynamic EPP tuning based on utilization
+	    - Works without CPPC firmware dependency
+
+	  This driver is designed for maximum performance while protecting
+	  silicon health through voltage monitoring and thermal throttling.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called zen-freq.
+
+	  If in doubt, say N.
+
+config ZEN_FREQ_DEBUG
+	bool "Enable zen-freq debugging"
+	depends on X86_ZEN_FREQ
+	help
+	  Enable verbose debug output for the zen-freq driver.
+
+	  If unsure, say N.
