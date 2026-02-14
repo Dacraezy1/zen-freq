@@ -1,0 +1,87 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# .gitignore for zen-freq kernel module
+#
+
+# Compiled kernel modules
+*.ko
+*.ko.strsplit
+*.mod
+*.mod.c
+*.mod.o
+*.o
+*.o.d
+*.o.ur-safe
+
+# Module symbols and order
+Module.symvers
+modules.order
+modules.builtin
+modules.builtin.modinfo
+
+# Build directories
+.tmp_versions/
+build/
+out/
+
+# Kernel build artifacts
+.*.cmd
+*.dwo
+*.swp
+*.swo
+*~
+
+# Archive files
+*.gz
+*.bz2
+*.xz
+*.tar
+*.tgz
+*.zip
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.cproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Debug files
+*.debug
+*.map
+
+# Testing artifacts
+test-results/
+coverage/
+*.log
+
+# Distribution
+dist/
+release/
+
+# DKMS
+dkms_source_tree/
+
+# Local configuration
+.env
+.config.local
+*.local
+
+# Backup files
+*.bak
+*.backup
+*.orig
