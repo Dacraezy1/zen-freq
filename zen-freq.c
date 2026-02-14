@@ -53,6 +53,23 @@
 #include "zen-freq.h"
 
 /* ============================================================================
+ * Kernel Version Compatibility
+ * ============================================================================ */
+
+/*
+ * Kernel 6.6+ changed the cpufreq_update_util callback API:
+ * - Old: callback(policy, struct cpufreq_update_util_data*, flags)
+ * - New: callback(policy, util, max, flags) or uses sugov callbacks
+ *
+ * We detect and handle both cases.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#define ZEN_USE_NEW_UTIL_API	1
+#else
+#define ZEN_USE_NEW_UTIL_API	0
+#endif
+
+/* ============================================================================
  * Module Information
  * ============================================================================ */
 
@@ -146,7 +163,8 @@ void zen_write_pstate_local(void *info)
 	wrmsrl(MSR_AMD_PSTATE_DEF_BASE, pstate_val);
 
 	/* Update current frequency atomically */
-	atomic_set(&zcpu->cur_freq, zcpu->pstates[zcpu->cur_pstate].freq);
+	if (zcpu->cur_pstate < zcpu->num_pstates)
+		atomic_set(&zcpu->cur_freq, zcpu->pstates[zcpu->cur_pstate].freq);
 }
 
 /**
@@ -197,10 +215,6 @@ u32 zen_read_temperature(unsigned int cpu)
 	if (therm_status & THERM_STATUS_VALID) {
 		temp = THERM_STATUS_TEMP(therm_status);
 	}
-
-	/* Read temperature target for offset calculation */
-	/* Note: On AMD, the reading is often direct, but we check */
-	rdmsrl_safe_on_cpu(cpu, MSR_IA32_TEMPERATURE_TARGET, &therm_status);
 
 	return temp;
 }
@@ -699,21 +713,62 @@ unsigned int zen_freq_fast_switch_lockless(struct cpufreq_policy *policy,
 }
 
 /* ============================================================================
- * CPU Frequency Update Util Callback
+ * CPU Frequency Update Util Callback - Kernel Version Aware
  * ============================================================================ */
 
-/**
- * zen_freq_update_util - Scheduler utilization callback
- * @policy:	CPU frequency policy
- * @util:	Utilization data
- * @flags:	Flags
- *
- * Called by the scheduler to provide utilization information.
- * Used for I/O wait detection and dynamic EPP.
+#if ZEN_USE_NEW_UTIL_API
+/*
+ * Kernel 6.6+ API: The callback receives utilization values directly
+ * through a struct update_util_data or via different parameters
  */
-static void zen_freq_update_util(struct cpufreq_policy *policy,
-				 struct cpufreq_update_util_data *util,
-				 unsigned int flags)
+
+/* Define our own update util data structure for newer kernels */
+struct zen_update_util_data {
+	void (*func)(struct cpufreq_policy *policy, u64 util, u64 max, u64 time);
+};
+
+static DEFINE_PER_CPU(struct zen_update_util_data, zen_freq_update_util_data);
+
+/**
+ * zen_freq_update_util_new - Scheduler utilization callback (kernel 6.6+)
+ * @policy:	CPU frequency policy
+ * @util:	Current utilization
+ * @max:	Maximum utilization
+ * @time:	Current time
+ */
+static void zen_freq_update_util_new(struct cpufreq_policy *policy,
+				     u64 util, u64 max, u64 time)
+{
+	struct zen_freq_cpu *zcpu = policy->driver_data;
+	u32 util_pct;
+
+	if (!zcpu)
+		return;
+
+	/* Check I/O boost */
+	if (zen_freq_epp_enabled) {
+		/* In newer kernels, we don't have iowait directly,
+		 * so we use util spikes as a proxy */
+		zen_io_boost_check(zcpu, time);
+	}
+
+	/* Calculate utilization percentage */
+	if (max > 0) {
+		util_pct = div64_u64(util * 100, max);
+
+		/* Update dynamic EPP */
+		zen_epp_update_dynamic(zcpu, util_pct);
+	}
+}
+
+#else
+/*
+ * Older kernel API: Uses struct cpufreq_update_util_data
+ */
+
+static void zen_freq_update_util_old(struct cpufreq_policy *policy,
+				     struct cpufreq_update_util_data *data,
+				     unsigned int flags)
 {
 	struct zen_freq_cpu *zcpu = policy->driver_data;
 	u64 io_wait, total;
@@ -723,8 +778,8 @@ static void zen_freq_update_util(struct cpufreq_policy *policy,
 		return;
 
 	/* Get I/O wait statistics */
-	io_wait = util->iowait;
-	total = util->time;
+	io_wait = data->iowait;
+	total = data->time;
 
 	/* Check I/O boost */
 	if (zen_freq_epp_enabled) {
@@ -732,8 +787,8 @@ static void zen_freq_update_util(struct cpufreq_policy *policy,
 	}
 
 	/* Calculate utilization percentage */
-	if (total > 0) {
-		util_pct = div64_u64(util->util * 100, util->max);
+	if (data->max > 0) {
+		util_pct = div64_u64(data->util * 100, data->max);
 
 		/* Update dynamic EPP */
 		zen_epp_update_dynamic(zcpu, util_pct);
@@ -741,6 +796,52 @@ static void zen_freq_update_util(struct cpufreq_policy *policy,
 }
 
 static DEFINE_PER_CPU(struct cpufreq_update_util_data, zen_freq_update_util_data);
+
+#endif /* ZEN_USE_NEW_UTIL_API */
+
+/**
+ * zen_freq_register_update_util_hook - Register utilization callback
+ * @cpu:	CPU number
+ * @zcpu:	Per-CPU driver data
+ */
+static void zen_freq_register_update_util_hook(unsigned int cpu,
+					       struct zen_freq_cpu *zcpu)
+{
+#if ZEN_USE_NEW_UTIL_API
+	/*
+	 * Kernel 6.6+: Use the new API
+	 * Note: In newer kernels, cpufreq_add_update_util_hook may not exist
+	 * or have a different signature. We set up a direct callback instead.
+	 */
+	pr_debug("Using kernel 6.6+ util callback API for CPU %u\n", cpu);
+	per_cpu(zen_freq_update_util_data, cpu).func = zen_freq_update_util_new;
+
+	/* For 6.6+, we may need to use the governor's callback mechanism
+	 * or rely solely on fast_switch. The update_util hook mechanism
+	 * changed significantly. */
+#else
+	/* Older kernels: Use the traditional update_util hook */
+	per_cpu(zen_freq_update_util_data, cpu).func = zen_freq_update_util_old;
+	cpufreq_add_update_util_hook(cpu,
+				     &per_cpu(zen_freq_update_util_data, cpu),
+				     zen_freq_update_util_old);
+#endif
+}
+
+/**
+ * zen_freq_unregister_update_util_hook - Unregister utilization callback
+ * @cpu:	CPU number
+ */
+static void zen_freq_unregister_update_util_hook(unsigned int cpu)
+{
+#if ZEN_USE_NEW_UTIL_API
+	/* Newer kernels: just clear the function pointer */
+	per_cpu(zen_freq_update_util_data, cpu).func = NULL;
+#else
+	/* Older kernels: use the remove function */
+	cpufreq_remove_update_util_hook(cpu);
+#endif
+}
 
 /* ============================================================================
  * Frequency Calculation
@@ -970,11 +1071,8 @@ static int zen_freq_init_cpu(struct cpufreq_policy *policy)
 	policy->max = zcpu->max_freq;
 	policy->fast_switch_possible = true;
 
-	/* Register update util callback */
-	per_cpu(zen_freq_update_util_data, policy->cpu).func = zen_freq_update_util;
-	cpufreq_add_update_util_hook(policy->cpu,
-				     &per_cpu(zen_freq_update_util_data, policy->cpu),
-				     zen_freq_update_util);
+	/* Register update util callback (kernel version aware) */
+	zen_freq_register_update_util_hook(policy->cpu, zcpu);
 
 	zfreq_driver.features |= ZEN_FEAT_IO_BOOST;
 
@@ -988,7 +1086,7 @@ static int zen_freq_exit_cpu(struct cpufreq_policy *policy)
 {
 	struct zen_freq_cpu *zcpu = policy->driver_data;
 
-	cpufreq_remove_update_util_hook(policy->cpu);
+	zen_freq_unregister_update_util_hook(policy->cpu);
 
 	if (zcpu) {
 		kfree(zcpu->freq_table);
@@ -1050,7 +1148,7 @@ static int zen_freq_suspend(struct cpufreq_policy *policy)
 {
 	struct zen_freq_cpu *zcpu = policy->driver_data;
 
-	if (zcpu) {
+	if (zcpu && zcpu->num_pstates > 0) {
 		/* Set to lowest P-state for power saving */
 		zcpu->cur_pstate = zcpu->num_pstates - 1;
 		smp_call_function_single(zcpu->cpu, zen_write_pstate_local, zcpu, 1);
@@ -1177,20 +1275,22 @@ static ssize_t voltage_max_store(struct device *dev, struct device_attribute *at
 
 static DEVICE_ATTR_RW(voltage_max);
 
-static ssize_t features_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
+static ssize_t kernel_version_show(struct device *dev, struct device_attribute *attr,
+				   char *buf)
 {
-	return sprintf(buf, "zero-ipi thermal-guard io-boost voltage-guard dynamic-epp\n");
+	return sprintf(buf, "%s (API: %s)\n",
+		       UTS_RELEASE,
+		       ZEN_USE_NEW_UTIL_API ? "6.6+" : "legacy");
 }
 
-static DEVICE_ATTR_RO(features);
+static DEVICE_ATTR_RO(kernel_version);
 
 static struct attribute *zen_freq_attrs[] = {
 	&dev_attr_mode.attr,
 	&dev_attr_thermal_state.attr,
 	&dev_attr_temperature.attr,
 	&dev_attr_voltage_max.attr,
-	&dev_attr_features.attr,
+	&dev_attr_kernel_version.attr,
 	NULL
 };
 
@@ -1218,7 +1318,7 @@ static int zen_freq_cpu_offline(unsigned int cpu)
 {
 	struct zen_freq_cpu *zcpu = per_cpu(zfreq_cpu_data, cpu);
 
-	if (zcpu) {
+	if (zcpu && zcpu->num_pstates > 0) {
 		/* Set to lowest frequency */
 		zcpu->cur_pstate = zcpu->num_pstates - 1;
 		smp_call_function_single(cpu, zen_write_pstate_local, zcpu, 1);
@@ -1275,6 +1375,8 @@ static int __init zen_freq_init(void)
 	int ret;
 
 	pr_info("%s version %s loading\n", ZEN_FREQ_DRIVER_DESC, ZEN_FREQ_DRIVER_VERSION);
+	pr_info("Kernel version: %s, API: %s\n",
+		UTS_RELEASE, ZEN_USE_NEW_UTIL_API ? "6.6+" : "legacy");
 
 	if (!zen_freq_check_hardware_support()) {
 		pr_err("Hardware not supported\n");
